@@ -4,6 +4,7 @@
 package api4
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -14,6 +15,9 @@ import (
 
 	_ "github.com/mattermost/go-i18n/i18n"
 )
+
+const ParamNameTeamID = "team_id"
+const ParamNameChannelID = "channel_id"
 
 type Routes struct {
 	Root    *mux.Router // ''
@@ -119,6 +123,160 @@ type API struct {
 	ConfigService       configservice.ConfigService
 	GetGlobalAppOptions app.AppOptionCreator
 	BaseRoutes          *Routes
+}
+
+type Method struct {
+	RequiredURLParams []*Parameter
+	OptionalURLParams []*Parameter
+
+	RequiredParams []*Parameter
+	OptionalParams []*Parameter
+
+	RequiredLicenseFeatures []string
+	RequiredPermissions     []*model.Permission
+
+	RequiredJSONDecodes map[string]func(io.Reader) interface{}
+
+	Unauthenticated bool
+
+	Implementation func(c *Context, w http.ResponseWriter, r *http.Request, params map[string]interface{})
+	api            *API
+}
+
+func (m *Method) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	middleware := func(c *Context, w http.ResponseWriter, r *http.Request) {
+		params := map[string]interface{}{}
+		props := mux.Vars(r)
+		query := r.URL.Query()
+
+		// validate required url params
+		for _, param := range m.RequiredURLParams {
+			val := query.Get(param.Key)
+			if len(val) == 0 || !param.IsValid(val) {
+				c.SetInvalidUrlParam(param.Key)
+				return
+			}
+			params[param.Key] = val
+		}
+
+		// validate optional url params
+		for _, param := range m.OptionalURLParams {
+			val := query.Get(param.Key)
+			if len(val) > 0 && !param.IsValid(val) {
+				c.SetInvalidUrlParam(param.Key)
+				return
+			}
+			params[param.Key] = val
+		}
+
+		// validate required params
+		for _, param := range m.RequiredParams {
+			val, ok := props[param.Key]
+			if !ok || !param.IsValid(val) {
+				c.SetInvalidParam(param.Key)
+				return
+			}
+			params[param.Key] = val
+		}
+
+		// validate optional params
+		for _, param := range m.OptionalParams {
+			val, ok := props[param.Key]
+			if ok && !param.IsValid(val) {
+				c.SetInvalidParam(param.Key)
+			}
+			params[param.Key] = val
+		}
+
+		// validate required JSON decodes
+		for key, decodeFunc := range m.RequiredJSONDecodes {
+			val := decodeFunc(r.Body)
+			if val == nil {
+				c.SetInvalidParam(key)
+				return
+			}
+			params[key] = val
+		}
+
+		// get special team_id and channel_id params
+		teamID := query.Get(ParamNameTeamID)
+		if len(teamID) == 0 {
+			if val, ok := props[ParamNameTeamID]; ok {
+				teamID = val
+			}
+		}
+		channelID := query.Get(ParamNameChannelID)
+		if len(channelID) == 0 {
+			if val, ok := props[ParamNameChannelID]; ok {
+				channelID = val
+			}
+		}
+
+		// check permissions
+		for _, permission := range m.RequiredPermissions {
+			var accessGranted bool
+			switch permission.Scope {
+			case model.PERMISSION_SCOPE_SYSTEM:
+				accessGranted = c.App.SessionHasPermissionTo(*c.App.Session(), permission)
+			case model.PERMISSION_SCOPE_TEAM:
+				if !model.IsValidId(teamID) {
+					// TODO: does it matter if this is SetInvalidParam vs SetInvalidUrlParam?
+					c.SetInvalidParam(ParamNameTeamID)
+				}
+				params[ParamNameTeamID] = teamID
+				accessGranted = c.App.SessionHasPermissionToTeam(*c.App.Session(), teamID, permission)
+			case model.PERMISSION_SCOPE_CHANNEL:
+				if !model.IsValidId(channelID) {
+					// TODO: does it matter if this is SetInvalidParam vs SetInvalidUrlParam?
+					c.SetInvalidParam(ParamNameChannelID)
+				}
+				params[ParamNameChannelID] = channelID
+				accessGranted = c.App.SessionHasPermissionToChannel(*c.App.Session(), channelID, permission)
+			}
+
+			if !accessGranted {
+				c.SetPermissionError(permission)
+				return
+			}
+		}
+
+		// check license features
+		var featureMap map[string]interface{}
+		var err *model.AppError
+		if len(m.RequiredLicenseFeatures) > 0 {
+			err = model.NewAppError("Api4", "api.license_error", nil, "", http.StatusNotImplemented)
+			if c.App.License() == nil {
+				c.Err = err
+				return
+			}
+			featureMap = c.App.License().Features.ToMap()
+		}
+		for _, licenseFeature := range m.RequiredLicenseFeatures {
+			val, ok := featureMap[licenseFeature]
+			if !ok || !val.(bool) {
+				c.Err = err // TODO: make this error more descriptive
+				return
+			}
+		}
+
+		m.Implementation(c, w, r, params)
+	}
+
+	if m.Unauthenticated {
+		m.api.ApiHandler(middleware).ServeHTTP(w, r)
+	} else {
+		m.api.ApiSessionRequired(middleware).ServeHTTP(w, r)
+	}
+}
+
+type Parameter struct {
+	Key     string
+	IsValid func(value interface{}) bool
+}
+
+func (a *API) NewMethod(method *Method) *Method {
+	method.api = a
+	return method
 }
 
 func Init(configservice configservice.ConfigService, globalOptionsFunc app.AppOptionCreator, root *mux.Router) *API {

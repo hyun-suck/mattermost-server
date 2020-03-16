@@ -6,6 +6,7 @@ package api4
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 
@@ -14,6 +15,22 @@ import (
 )
 
 func (api *API) InitGroup() {
+	patchGroupMethod := api.NewMethod(&Method{
+		RequiredParams: []*Parameter{
+			&Parameter{Key: "group_id", IsValid: func(value interface{}) bool {
+				return len(value.(string)) == 26
+			}},
+		},
+		RequiredLicenseFeatures: []string{"ldap_groups"},
+		RequiredPermissions:     []*model.Permission{model.PERMISSION_MANAGE_SYSTEM},
+		Implementation:          patchGroup,
+		RequiredJSONDecodes: map[string]func(io.Reader) interface{}{
+			"group_patch": func(data io.Reader) interface{} {
+				return model.GroupPatchFromJson(data)
+			},
+		},
+	})
+
 	// GET /api/v4/groups
 	api.BaseRoutes.Groups.Handle("", api.ApiSessionRequired(getGroups)).Methods("GET")
 
@@ -22,8 +39,7 @@ func (api *API) InitGroup() {
 		api.ApiSessionRequired(getGroup)).Methods("GET")
 
 	// PUT /api/v4/groups/:group_id/patch
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/patch",
-		api.ApiSessionRequired(patchGroup)).Methods("PUT")
+	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/patch", patchGroupMethod).Methods("PUT")
 
 	// POST /api/v4/groups/:group_id/teams/:team_id/link
 	// POST /api/v4/groups/:group_id/channels/:channel_id/link
@@ -94,33 +110,15 @@ func getGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func patchGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	groupPatch := model.GroupPatchFromJson(r.Body)
-	if groupPatch == nil {
-		c.SetInvalidParam("group")
-		return
-	}
+func patchGroup(c *Context, w http.ResponseWriter, r *http.Request, params map[string]interface{}) {
+	groupPatch := params["group_patch"].(*model.GroupPatch)
 
 	auditRec := c.MakeAuditRecord("patchGroup", audit.Fail)
 	defer c.LogAuditRec(auditRec)
-	auditRec.AddMeta("group_id", c.Params.GroupId)
+	groupID := params["group_id"].(string)
+	auditRec.AddMeta("group_id", groupID)
 
-	if c.App.License() == nil || !*c.App.License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.patchGroup", "api.ldap_groups.license_error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
-		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
-		return
-	}
-
-	group, err := c.App.GetGroup(c.Params.GroupId)
+	group, err := c.App.GetGroup(groupID)
 	if err != nil {
 		c.Err = err
 		return
